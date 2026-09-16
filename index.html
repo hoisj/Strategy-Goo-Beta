@@ -5,6 +5,7 @@
 <title>Strategy Goo</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
 <style>
   :root{
     --bg:#171b13;
@@ -148,6 +149,11 @@
   .legend{display:flex; gap:14px; flex-wrap:wrap; font-size:0.72rem; color:var(--ink-dim); margin-top:10px;}
   .legend span{display:inline-flex; align-items:center; gap:5px;}
   .swatch{width:11px; height:11px; border-radius:50%; display:inline-block;}
+  .room-code{font-family:'Cinzel',serif; font-size:2.2rem; letter-spacing:0.15em; color:var(--gold); margin:10px 0;}
+  .code-input{
+    font-family:'Cinzel',serif; font-size:1.4rem; letter-spacing:0.2em; text-align:center; text-transform:uppercase;
+    padding:8px; width:150px; background:#1a1f15; border:1px solid var(--panel-border); color:var(--ink); border-radius:3px;
+  }
 </style>
 </head>
 <body>
@@ -158,11 +164,11 @@
       <span id="difficultyTag" class="diff-tag"></span>
       <span>Round <span id="roundNum">1</span> of 3</span>
       <div class="row" style="gap:6px;">
-        <span style="color:var(--player)">You</span>
+        <span id="playerLabel" style="color:var(--player)">You</span>
         <div class="pip-row" id="playerPips"></div>
         <span style="margin:0 4px;">–</span>
         <div class="pip-row" id="botPips"></div>
-        <span style="color:var(--enemy)">Bot</span>
+        <span id="botLabel" style="color:var(--enemy)">Bot</span>
       </div>
     </div>
   </header>
@@ -221,6 +227,27 @@ const DIFFICULTIES = {
 };
 function botBudget(){ return Math.round(totalBudgetBase() * DIFFICULTIES[G.difficulty].budgetMult); }
 
+/* ============================= ROLE / MODE HELPERS ============================= */
+
+// "player" = bottom/teal side, "bot" = top/red side. Who actually CONTROLS each side
+// depends on G.mode: vsBot -> AI controls bot; passPlay -> a human controls bot on
+// the same device, turn by turn; online -> a human controls bot on a different device.
+function otherRole(r){ return r==='player' ? 'bot' : 'player'; }
+function colorFor(role){ return role==='player' ? 'var(--player)' : 'var(--enemy)'; }
+function teamName(role){ return role==='player' ? 'Teal' : 'Red'; } // used in the shared/synced log — must read the same on both screens
+function sideLabel(role){ // used in on-screen chrome only — safe to be viewer-relative
+  if(!G.mode) return role==='player' ? 'Player 1' : 'Player 2';
+  if(G.mode==='vsBot') return role==='player' ? 'You' : 'Bot';
+  if(G.mode==='passPlay') return role==='player' ? 'Player 1 (Teal)' : 'Player 2 (Red)';
+  return role===G.myRole ? 'You' : 'Opponent';
+}
+// Whose perspective the board/fog/turn-permissions should currently reflect.
+function viewerRole(){
+  if(G.phase==='setup' || G.phase==='placing') return G.activeSetupRole;
+  if(G.mode==='passPlay') return G.turn;
+  return G.myRole;
+}
+
 /* ============================= STATE ============================= */
 
 let G = null;
@@ -230,7 +257,10 @@ function newMatch(){
     round: 1,
     wins: { player:0, bot:0 },
     leftover: 0,
-    phase: 'difficulty',
+    phase: 'mainmenu',
+    mode: null,        // 'vsBot' | 'passPlay' | 'online'
+    myRole: null,      // fixed per-device role for online; 'player' for vsBot
+    activeSetupRole: null, // whose shop/placement is currently active (matters for passPlay)
     difficulty: 'medium',
     map: null,
     units: [],
@@ -244,8 +274,39 @@ function newMatch(){
     uiMode: 'idle',
     log: [],
     mapMode: null,
+    localReady: false,
+    oppReady: false,
+    oppUnits: null,
+    roomCode: null,
+    netStatus: '',
+    interstitialMessage: '',
+    interstitialContinue: null,
   };
+  BOARD.w = 7; BOARD.h = 14;
   render();
+}
+
+function chooseMode(mode){
+  G.mode = mode;
+  if(mode === 'vsBot'){
+    G.myRole = 'player';
+    G.phase = 'difficulty';
+  } else if(mode === 'passPlay'){
+    G.myRole = null;
+    G.activeSetupRole = null;
+    BOARD.w = 7; BOARD.h = 14;
+    G.phase = 'mapselect';
+    G.mapMode = null;
+  } else if(mode === 'online'){
+    G.phase = 'onlineMenu';
+  }
+  render();
+}
+
+function backToMainMenu(){
+  if(netConn){ try{ netConn.close(); }catch(e){} netConn=null; }
+  if(netPeer){ try{ netPeer.destroy(); }catch(e){} netPeer=null; }
+  newMatch();
 }
 
 function setDifficulty(key){
@@ -262,12 +323,14 @@ function setMap(mapKey){
   BOARD.w = 7; BOARD.h = 14;
   G.map = MAPS.find(m=>m.key===mapKey);
   startSetup();
+  if(G.mode==='online' && G.myRole==='player') netSend({type:'state', state:serializeState()});
 }
 
 function setCustomMap(mapObj){
   if(mapObj.boardW){ BOARD.w = mapObj.boardW; BOARD.h = mapObj.boardH; }
   G.map = mapObj;
   startSetup();
+  if(G.mode==='online' && G.myRole==='player') netSend({type:'state', state:serializeState()});
 }
 
 // Fully random, independent (non-mirrored) terrain, on a random side length (5-15
@@ -287,7 +350,7 @@ function generateRandomMap(){
       r = 0.4 + Math.random()*0.9;
       x = r + Math.random()*(w - 2*r);
       y = 1.0 + Math.random()*(h - 2.0);
-      ok = bases.every(b => dist(x,y,b.x,b.y) > r + 1.1); // don't bury a base entirely
+      ok = bases.every(b => Math.hypot(x-b.x,y-b.y) > r + 1.1); // don't bury a base entirely
       tries++;
     }
     if(!ok) continue;
@@ -412,10 +475,158 @@ function isUnitVisibleTo(ownerKey, target){
   return visibleTilePoint(ownerKey, target.x, target.y);
 }
 
+/* ============================= NETWORKING (online mode, PeerJS) ============================= */
+
+let netPeer = null;
+let netConn = null;
+const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function randomRoomCode(){
+  let s = '';
+  for(let i=0;i<4;i++) s += ROOM_ALPHABET[Math.floor(Math.random()*ROOM_ALPHABET.length)];
+  return s;
+}
+
+function netSend(msg){
+  if(netConn && netConn.open) netConn.send(msg);
+}
+
+function hostGame(attempt){
+  attempt = attempt || 0;
+  const code = randomRoomCode();
+  G.phase = 'onlineHostWait';
+  G.roomCode = code;
+  G.netStatus = 'Connecting to relay…';
+  render();
+  const peer = new Peer('sg-'+code);
+  netPeer = peer;
+  peer.on('open', ()=>{
+    G.netStatus = "Room ready — waiting for your friend to join…";
+    render();
+  });
+  peer.on('connection', (conn)=>{
+    netConn = conn;
+    conn.on('open', ()=>{
+      G.myRole = 'player';
+      G.mode = 'online';
+      G.phase = 'mapselect';
+      G.mapMode = null;
+      BOARD.w=7; BOARD.h=14;
+      render();
+    });
+    conn.on('data', handleNetMessage);
+    conn.on('close', onPeerDisconnected);
+  });
+  peer.on('error', (err)=>{
+    if(err.type === 'unavailable-id' && attempt < 5){
+      peer.destroy();
+      hostGame(attempt+1);
+    } else {
+      G.netStatus = 'Connection error (' + err.type + '). Try again.';
+      render();
+    }
+  });
+}
+
+function joinGame(rawCode){
+  const code = (rawCode||'').trim().toUpperCase();
+  if(!code) return;
+  G.netStatus = 'Connecting…';
+  render();
+  const peer = new Peer();
+  netPeer = peer;
+  peer.on('open', ()=>{
+    const conn = peer.connect('sg-'+code, {reliable:true});
+    netConn = conn;
+    conn.on('open', ()=>{
+      G.myRole = 'bot';
+      G.mode = 'online';
+      G.phase = 'mapselect';
+      render();
+    });
+    conn.on('data', handleNetMessage);
+    conn.on('close', onPeerDisconnected);
+    conn.on('error', ()=>{
+      G.netStatus = "Couldn't connect — check the code and try again.";
+      render();
+    });
+  });
+  peer.on('error', (err)=>{
+    G.netStatus = 'Connection error (' + err.type + '). Try again.';
+    render();
+  });
+}
+
+function onPeerDisconnected(){
+  logMsg('Connection to your opponent was lost.');
+  render();
+}
+
+function serializeState(){
+  return {
+    round: G.round, wins: {player:G.wins.player, bot:G.wins.bot}, leftover: G.leftover,
+    phase: G.phase, map: G.map, units: JSON.parse(JSON.stringify(G.units)), nextId: G.nextId,
+    turn: G.turn, actionsLeft: G.actionsLeft, log: G.log.slice(-30), roundWinner: G.roundWinner,
+    boardW: BOARD.w, boardH: BOARD.h,
+  };
+}
+function applyState(s){
+  G.round=s.round; G.wins=s.wins; G.leftover=s.leftover; G.phase=s.phase;
+  G.map=s.map; G.units=s.units; G.nextId=s.nextId; G.turn=s.turn;
+  G.actionsLeft=s.actionsLeft; G.log=s.log; G.roundWinner=s.roundWinner;
+  BOARD.w=s.boardW; BOARD.h=s.boardH;
+  G.selected=null; G.uiMode='idle';
+  if(s.phase === 'setup'){
+    // the guest never calls startSetup() locally (it only ever adopts the host's
+    // broadcast phase), so its shop counts and active role need init here instead —
+    // this only ever fires once per round, right when the host's map choice arrives.
+    Object.keys(UNIT_TYPES).forEach(k => G.shopCounts[k] = 0);
+    G.activeSetupRole = G.myRole;
+  }
+  render();
+}
+function handleNetMessage(msg){
+  if(!msg) return;
+  if(msg.type === 'ready'){
+    G.oppReady = true;
+    G.oppUnits = msg.units;
+    maybeHostMerge();
+  } else if(msg.type === 'state'){
+    applyState(msg.state);
+  }
+}
+// Host is authoritative for combining both sides' independently-placed rosters into
+// one shared battle state, avoiding any merge race between the two peers.
+function maybeHostMerge(){
+  if(G.myRole !== 'player') return;
+  if(!G.localReady || !G.oppReady) return;
+  const mine = G.units.filter(u=>u.owner==='player');
+  G.units = mine.concat(G.oppUnits);
+  G.phase = 'battle';
+  G.turn = 'player';
+  G.actionsLeft = 3;
+  G.units.forEach(u=>u.acted=false);
+  logMsg(`Round ${G.round} begins on "${G.map.name}".`);
+  netSend({type:'state', state:serializeState()});
+  render();
+}
+function onlineRematch(){
+  G.round=1; G.wins={player:0,bot:0}; G.leftover=0; G.units=[]; G.nextId=1;
+  G.selected=null; G.uiMode='idle'; G.phase='mapselect'; G.mapMode=null;
+  G.localReady=false; G.oppReady=false; G.oppUnits=null;
+  BOARD.w=7; BOARD.h=14;
+  render();
+  netSend({type:'state', state:serializeState()});
+}
+
 /* ============================= SETUP PHASE ============================= */
 
 function startSetup(){
   G.phase = 'setup';
+  if(G.mode !== 'passPlay'){
+    G.activeSetupRole = G.myRole; // vsBot & online: always "my" role
+  } else if(!G.activeSetupRole){
+    G.activeSetupRole = 'player'; // first setup of the round in pass & play
+  }
   Object.keys(UNIT_TYPES).forEach(k => G.shopCounts[k] = 0);
   render();
 }
@@ -440,15 +651,17 @@ function confirmShop(){
   G.placementQueue = q;
   G.placeCursor = 0;
   G.phase = 'placing';
-  const bs = baseSpawn('player');
-  G.units.push({id:G.nextId++, owner:'player', key:'base', isBase:true, x:bs.x, y:bs.y, hp:BASE_STATS.hp, maxHp:BASE_STATS.hp, acted:false});
+  const role = G.activeSetupRole;
+  const bs = baseSpawn(role);
+  G.units.push({id:G.nextId++, owner:role, key:'base', isBase:true, x:bs.x, y:bs.y, hp:BASE_STATS.hp, maxHp:BASE_STATS.hp, acted:false});
   render();
 }
 
 function placeAt(x,y){
   if(G.phase !== 'placing') return;
   if(G.placeCursor >= G.placementQueue.length) return;
-  if(!ownHalf('player', y)) return;
+  const role = G.activeSetupRole;
+  if(!ownHalf(role, y)) return;
   if(!inBoundsXY(x,y)) return;
   const key = G.placementQueue[G.placeCursor];
   const inMountain = pointInAnyMountain(x,y);
@@ -461,7 +674,7 @@ function placeAt(x,y){
   }
   if(tooCloseToAnyUnit(x,y,null)) return;
   const def = UNIT_TYPES[key];
-  G.units.push({id:G.nextId++, owner:'player', key, isBase:false, x, y, hp:def.hp, maxHp:def.hp, acted:false, hasLanded:false});
+  G.units.push({id:G.nextId++, owner:role, key, isBase:false, x, y, hp:def.hp, maxHp:def.hp, acted:false, hasLanded:false});
   G.placeCursor++;
   if(G.placeCursor >= G.placementQueue.length) finalizeSetupAndStartBattle();
   else render();
@@ -486,7 +699,6 @@ function botSetup(){
       let placed=false;
       for(let attempt=0; attempt<120 && !placed; attempt++){
         const x = Math.random()*BOARD.w;
-        // ships need the full half searched for water; land units stay toward the back
         const y = k==='cannonship' ? Math.random()*(BOARD.h/2) : Math.random()*(BOARD.h/4);
         const inMountain = pointInAnyMountain(x,y);
         const inLake = pointInAnyLake(x,y);
@@ -502,7 +714,26 @@ function botSetup(){
 }
 
 function finalizeSetupAndStartBattle(){
-  botSetup();
+  if(G.mode === 'vsBot'){
+    botSetup();
+    startBattlePhase();
+  } else if(G.mode === 'passPlay'){
+    if(G.activeSetupRole === 'player'){
+      G.activeSetupRole = 'bot';
+      showInterstitial(`Pass the device to ${sideLabel('bot')}. Tap Continue when you're ready to set up.`, ()=>{ startSetup(); });
+    } else {
+      startBattlePhase();
+    }
+  } else if(G.mode === 'online'){
+    G.localReady = true;
+    netSend({type:'ready', units: G.units.filter(u=>u.owner===G.myRole)});
+    G.phase = 'onlineWaitingOpp';
+    render();
+    maybeHostMerge();
+  }
+}
+
+function startBattlePhase(){
   G.phase = 'battle';
   G.turn = 'player';
   G.actionsLeft = 3;
@@ -515,7 +746,8 @@ function finalizeSetupAndStartBattle(){
 
 function selectUnit(id){
   const u = G.units.find(x=>x.id===id);
-  if(!u || u.owner!=='player' || u.hp<=0) return;
+  const me = viewerRole();
+  if(!u || u.owner!==me || u.hp<=0) return;
   if(u.acted){ G.selected=null; G.uiMode='idle'; render(); return; }
   G.selected = id; G.uiMode = 'idle'; render();
 }
@@ -527,11 +759,11 @@ function doMove(unit,x,y){
   unit.x = x; unit.y = y;
   if(unit.key==='cannonship' && !pointInAnyLake(x,y)){
     unit.hasLanded = true;
-    logMsg(`Your Cannonship comes ashore — it can't move again.`);
+    logMsg(`${teamName(unit.owner)}'s Cannonship comes ashore — it can't move again.`);
   }
   unit.acted = true;
   G.actionsLeft--;
-  logMsg(`Your ${labelFor(unit)} moves to a new position.`);
+  logMsg(`${teamName(unit.owner)}'s ${labelFor(unit)} moves.`);
   clearSelectionAfterAction();
 }
 
@@ -540,15 +772,13 @@ function doAttack(attacker, defender){
   defender.hp -= aStats.dmg;
   attacker.acted = true;
   G.actionsLeft--;
-  const label = owner(defender)==='player' ? 'your' : "the bot's";
-  const labelCap = owner(defender)==='player' ? 'Your' : "The bot's";
-  logMsg(`Your ${labelFor(attacker)} hits ${label} ${labelFor(defender)} for ${aStats.dmg}.`);
+  logMsg(`${teamName(attacker.owner)}'s ${labelFor(attacker)} hits ${teamName(defender.owner)}'s ${labelFor(defender)} for ${aStats.dmg}.`);
   if(defender.hp <= 0){
-    logMsg(`${labelCap} ${labelFor(defender)} is destroyed!`);
+    logMsg(`${teamName(defender.owner)}'s ${labelFor(defender)} is destroyed!`);
   } else if(dStats.range >= dist(attacker.x,attacker.y,defender.x,defender.y)){
     attacker.hp -= dStats.dmg;
-    logMsg(`${labelCap} ${labelFor(defender)} retaliates for ${dStats.dmg}.`);
-    if(attacker.hp <= 0) logMsg(`Your ${labelFor(attacker)} is destroyed by the retaliation!`);
+    logMsg(`${teamName(defender.owner)}'s ${labelFor(defender)} retaliates for ${dStats.dmg}.`);
+    if(attacker.hp <= 0) logMsg(`${teamName(attacker.owner)}'s ${labelFor(attacker)} is destroyed by the retaliation!`);
   }
   clearSelectionAfterAction();
 }
@@ -556,15 +786,37 @@ function doAttack(attacker, defender){
 function clearSelectionAfterAction(){
   G.selected = null; G.uiMode = 'idle';
   checkRoundEnd();
-  if(G.phase !== 'battle'){ render(); return; }
-  if(G.actionsLeft <= 0) endPlayerTurn(); else render();
+  if(G.phase === 'battle' && G.actionsLeft <= 0){
+    endPlayerTurn(); // handles its own render + (online) network sync
+    return;
+  }
+  render();
+  if(G.mode==='online') netSend({type:'state', state:serializeState()});
 }
 
 function endPlayerTurn(){
   if(G.phase !== 'battle') return;
-  G.turn = 'bot';
-  render();
-  setTimeout(runBotTurn, 500);
+  const me = viewerRole();
+  if(G.turn !== me) return;
+  const next = otherRole(G.turn);
+  G.turn = next;
+
+  if(G.mode === 'vsBot'){
+    render();
+    setTimeout(runBotTurn, 500);
+  } else if(G.mode === 'passPlay'){
+    showInterstitial(`Pass the device to ${sideLabel(next)}. Tap Continue when ready.`, ()=>{
+      G.actionsLeft = 3;
+      G.units.forEach(u=>u.acted=false);
+      G.phase = 'battle';
+      render();
+    });
+  } else if(G.mode === 'online'){
+    G.actionsLeft = 3;
+    G.units.forEach(u=>u.acted=false);
+    render();
+    netSend({type:'state', state:serializeState()});
+  }
 }
 
 function runBotTurn(){
@@ -612,7 +864,6 @@ function botAct(){
   const tier = DIFFICULTIES[G.difficulty].tier;
   const knownEnemies = () => tier>=3 ? livingUnits('player') : livingUnits('player').filter(p=>isUnitVisibleTo('bot',p));
 
-  // --- Attack phase ---
   const candidates = [];
   mine.forEach(u=>{
     const stats = statsOf(u);
@@ -632,20 +883,17 @@ function botAct(){
     return true;
   }
 
-  // --- Movement phase ---
   for(const u of mine){
     const stats = statsOf(u);
     if(stats.speed<=0){ u.acted=true; continue; }
     let enemies = knownEnemies();
-    if(enemies.length===0) enemies = livingUnits('player'); // rough memory of where the fight is, even through fog
+    if(enemies.length===0) enemies = livingUnits('player');
     if(enemies.length===0){ u.acted=true; continue; }
     let best=null, bestDist=Infinity;
     enemies.forEach(e=>{ const d=dist(e.x,e.y,u.x,u.y); if(d<bestDist){ bestDist=d; best=e; } });
     const angle = Math.atan2(best.y-u.y, best.x-u.x);
     let dest = marchMax(u, angle, stats.speed);
     if(tier>=2){
-      // avoid marching into a spot where a known enemy could one-shot this unit next turn,
-      // unless this unit could threaten something back from there.
       const lethalNearby = enemies.some(e=>{
         const eStats = statsOf(e);
         return eStats.range >= dist(dest.x,dest.y,e.x,e.y) && eStats.dmg >= u.hp;
@@ -664,7 +912,7 @@ function botAct(){
     }
     u.x=fx; u.y=fy; u.acted=true;
     if(u.key==='cannonship' && !pointInAnyLake(fx,fy)) u.hasLanded = true;
-    logMsg(`The bot's ${labelFor(u)} advances.`);
+    logMsg(`${teamName(u.owner)}'s ${labelFor(u)} advances.`);
     return true;
   }
   return false;
@@ -674,13 +922,13 @@ function botAttack(attacker, defender){
   const aStats = statsOf(attacker), dStats = statsOf(defender);
   defender.hp -= aStats.dmg;
   attacker.acted = true;
-  logMsg(`The bot's ${labelFor(attacker)} hits your ${labelFor(defender)} for ${aStats.dmg}.`);
+  logMsg(`${teamName(attacker.owner)}'s ${labelFor(attacker)} hits ${teamName(defender.owner)}'s ${labelFor(defender)} for ${aStats.dmg}.`);
   if(defender.hp <= 0){
-    logMsg(`Your ${labelFor(defender)} is destroyed!`);
+    logMsg(`${teamName(defender.owner)}'s ${labelFor(defender)} is destroyed!`);
   } else if(dStats.range >= dist(attacker.x,attacker.y,defender.x,defender.y)){
     attacker.hp -= dStats.dmg;
-    logMsg(`Your ${labelFor(defender)} retaliates for ${dStats.dmg}.`);
-    if(attacker.hp <= 0) logMsg(`The bot's ${labelFor(attacker)} is destroyed by the retaliation!`);
+    logMsg(`${teamName(defender.owner)}'s ${labelFor(defender)} retaliates for ${dStats.dmg}.`);
+    if(attacker.hp <= 0) logMsg(`${teamName(attacker.owner)}'s ${labelFor(attacker)} is destroyed by the retaliation!`);
   }
   checkRoundEnd();
 }
@@ -690,10 +938,10 @@ function checkRoundEnd(){
   const botBase = G.units.find(u=>u.owner==='bot' && u.isBase);
   if(playerBase && playerBase.hp<=0){
     G.wins.bot++; G.phase='roundover'; G.roundWinner='bot';
-    logMsg(`Your base has fallen. The bot wins round ${G.round}.`);
+    logMsg(`${teamName('player')}'s base has fallen — ${teamName('bot')} wins round ${G.round}.`);
   } else if(botBase && botBase.hp<=0){
     G.wins.player++; G.phase='roundover'; G.roundWinner='player';
-    logMsg(`The enemy base is destroyed! You win round ${G.round}.`);
+    logMsg(`${teamName('bot')}'s base has fallen — ${teamName('player')} wins round ${G.round}.`);
   }
   if(G.phase==='roundover' && (G.wins.player>=2 || G.wins.bot>=2)) G.phase='matchover';
 }
@@ -708,7 +956,17 @@ function nextRound(){
   G.uiMode = 'idle';
   G.phase = 'mapselect';
   G.mapMode = null;
-  BOARD.w = 7; BOARD.h = 14; // reset; a random map (if chosen again) will resize this
+  G.activeSetupRole = null;
+  G.localReady = false; G.oppReady = false; G.oppUnits = null;
+  BOARD.w = 7; BOARD.h = 14;
+  render();
+  if(G.mode==='online' && G.myRole==='player') netSend({type:'state', state:serializeState()});
+}
+
+function showInterstitial(message, onContinue){
+  G.phase = 'interstitial';
+  G.interstitialMessage = message;
+  G.interstitialContinue = onContinue;
   render();
 }
 
@@ -755,13 +1013,24 @@ function renderPips(){
   }
   document.getElementById('roundNum').textContent = Math.min(G.round,3);
   const tag = document.getElementById('difficultyTag');
-  tag.textContent = (G.phase!=='difficulty' && G.difficulty) ? DIFFICULTIES[G.difficulty].label : '';
+  const hideDiffPhases = ['mainmenu','difficulty','onlineMenu','onlineHostWait','onlineJoinEntry'];
+  tag.textContent = (G.mode==='vsBot' && !hideDiffPhases.includes(G.phase) && G.difficulty) ? DIFFICULTIES[G.difficulty].label : '';
+  const pl = document.getElementById('playerLabel');
+  const bl = document.getElementById('botLabel');
+  if(pl) pl.textContent = sideLabel('player');
+  if(bl) bl.textContent = sideLabel('bot');
 }
 
 function render(){
   renderPips();
   const app = document.getElementById('app');
   app.innerHTML = '';
+  if(G.phase==='mainmenu'){ app.appendChild(renderMainMenu()); return; }
+  if(G.phase==='onlineMenu'){ app.appendChild(renderOnlineMenu()); return; }
+  if(G.phase==='onlineHostWait'){ app.appendChild(renderOnlineHostWait()); return; }
+  if(G.phase==='onlineJoinEntry'){ app.appendChild(renderOnlineJoinEntry()); return; }
+  if(G.phase==='onlineWaitingOpp'){ app.appendChild(renderOnlineWaitingOpp()); return; }
+  if(G.phase==='interstitial'){ app.appendChild(renderInterstitial()); return; }
   if(G.phase==='difficulty'){ app.appendChild(renderDifficultySelect()); return; }
   if(G.phase==='mapselect'){ app.appendChild(renderMapSelect()); return; }
   if(G.phase==='setup'){ app.appendChild(renderSetup()); return; }
@@ -769,6 +1038,99 @@ function render(){
   if(G.phase==='battle'){ app.appendChild(renderBattleLayout(false)); return; }
   if(G.phase==='roundover'){ app.appendChild(renderRoundOver()); return; }
   if(G.phase==='matchover'){ app.appendChild(renderMatchOver()); return; }
+}
+
+function renderMainMenu(){
+  const wrap = el('div',{});
+  const panel = el('div',{class:'panel'});
+  panel.appendChild(el('h2',{}, 'How do you want to play?'));
+  const grid = el('div',{class:'card-grid'});
+
+  const vsBotCard = el('div',{class:'map-card'});
+  vsBotCard.appendChild(el('div',{style:'font-size:2.4rem; text-align:center;'}, '🤖'));
+  vsBotCard.appendChild(el('b',{}, 'vs Bot'));
+  vsBotCard.appendChild(el('span',{}, 'Play against the AI, with adjustable difficulty.'));
+  vsBotCard.appendChild(el('button',{onclick:()=>chooseMode('vsBot')}, 'Play vs Bot'));
+  grid.appendChild(vsBotCard);
+
+  const passCard = el('div',{class:'map-card'});
+  passCard.appendChild(el('div',{style:'font-size:2.4rem; text-align:center;'}, '🪑'));
+  passCard.appendChild(el('b',{}, 'Pass & Play'));
+  passCard.appendChild(el('span',{}, "Two players, one device. You'll pass the screen between turns so no one sees the other side."));
+  passCard.appendChild(el('button',{onclick:()=>chooseMode('passPlay')}, 'Play Pass & Play'));
+  grid.appendChild(passCard);
+
+  const onlineCard = el('div',{class:'map-card'});
+  onlineCard.appendChild(el('div',{style:'font-size:2.4rem; text-align:center;'}, '🌐'));
+  onlineCard.appendChild(el('b',{}, 'Online'));
+  onlineCard.appendChild(el('span',{}, 'Play with a friend on a different device — one of you hosts, the other joins with a short code.'));
+  onlineCard.appendChild(el('button',{onclick:()=>chooseMode('online')}, 'Play Online'));
+  grid.appendChild(onlineCard);
+
+  panel.appendChild(grid);
+  wrap.appendChild(panel);
+  return wrap;
+}
+
+function renderOnlineMenu(){
+  const wrap = el('div',{});
+  const panel = el('div',{class:'panel'});
+  panel.appendChild(el('h2',{}, 'Online — Host or Join'));
+  panel.appendChild(el('p',{class:'hint'}, "Uses a free peer-to-peer connection (PeerJS) — no accounts needed, but it depends on a public relay staying up, and very restrictive networks can sometimes block the direct connection."));
+  const grid = el('div',{class:'card-grid'});
+  const hostCard = el('div',{class:'map-card'});
+  hostCard.appendChild(el('b',{}, 'Host a Game'));
+  hostCard.appendChild(el('span',{}, 'Creates a room code for your friend to join.'));
+  hostCard.appendChild(el('button',{onclick:()=>hostGame()}, 'Host'));
+  grid.appendChild(hostCard);
+  const joinCard = el('div',{class:'map-card'});
+  joinCard.appendChild(el('b',{}, 'Join a Game'));
+  joinCard.appendChild(el('span',{}, 'Enter the code your friend gave you.'));
+  joinCard.appendChild(el('button',{onclick:()=>{ G.phase='onlineJoinEntry'; G.netStatus=''; render(); }}, 'Join'));
+  grid.appendChild(joinCard);
+  panel.appendChild(grid);
+  panel.appendChild(el('button',{class:'ghost', style:'margin-top:12px;', onclick:backToMainMenu}, '← Back'));
+  wrap.appendChild(panel);
+  return wrap;
+}
+
+function renderOnlineHostWait(){
+  const panel = el('div',{class:'panel center-msg'});
+  panel.appendChild(el('h2',{}, 'Waiting for your friend…'));
+  panel.appendChild(el('p',{}, 'Give them this code:'));
+  panel.appendChild(el('div',{class:'room-code'}, G.roomCode || '…'));
+  panel.appendChild(el('p',{class:'hint'}, G.netStatus || 'Setting up…'));
+  panel.appendChild(el('button',{class:'ghost', onclick:backToMainMenu}, 'Cancel'));
+  return panel;
+}
+
+function renderOnlineJoinEntry(){
+  const panel = el('div',{class:'panel center-msg'});
+  panel.appendChild(el('h2',{}, 'Enter the room code'));
+  const input = el('input',{id:'joinCodeInput', type:'text', maxlength:'6', placeholder:'ABCD', class:'code-input'});
+  panel.appendChild(input);
+  panel.appendChild(el('div',{class:'row', style:'justify-content:center; margin-top:12px;'},[
+    el('button',{onclick:()=>joinGame(input.value)}, 'Connect'),
+    el('button',{class:'ghost', onclick:backToMainMenu}, 'Cancel'),
+  ]));
+  if(G.netStatus) panel.appendChild(el('p',{class:'hint'}, G.netStatus));
+  return panel;
+}
+
+function renderOnlineWaitingOpp(){
+  const panel = el('div',{class:'panel center-msg'});
+  panel.appendChild(el('h2',{}, 'Waiting for your opponent to finish setting up…'));
+  panel.appendChild(el('p',{class:'hint'}, "The battle starts automatically once they're ready."));
+  return panel;
+}
+
+function renderInterstitial(){
+  const p = el('div',{class:'panel center-msg'});
+  p.appendChild(el('div',{style:'font-size:2.4rem; margin-bottom:6px;'}, '🔄'));
+  p.appendChild(el('h2',{}, 'Pass the device'));
+  p.appendChild(el('p',{}, G.interstitialMessage));
+  p.appendChild(el('button',{onclick:()=>{ const fn=G.interstitialContinue; G.interstitialContinue=null; if(fn) fn(); }}, 'Continue'));
+  return p;
 }
 
 function renderDifficultySelect(){
@@ -818,6 +1180,14 @@ function tinyMapPreview(map){
 function renderMapSelect(){
   const wrap = el('div',{});
   const panel = el('div',{class:'panel'});
+
+  if(G.mode==='online' && G.myRole!=='player'){
+    panel.appendChild(el('h2',{}, 'Waiting for the host to choose a map…'));
+    panel.appendChild(el('p',{class:'hint'}, "The battlefield will appear here as soon as they pick one."));
+    wrap.appendChild(panel);
+    return wrap;
+  }
+
   panel.appendChild(el('h2',{}, `Round ${G.round}: choose your battlefield`));
   panel.appendChild(el('div',{class:'budget-line'}, `Preset maps play a 7×7 zone per side (${totalBudgetBase()} pts). The random battlefield rolls its own size too — points always scale to 4× the side length.` + (G.leftover>0?` +${G.leftover} carried over.`:'')));
 
@@ -834,7 +1204,7 @@ function renderMapSelect(){
     const presetCard = el('div',{class:'map-card'});
     presetCard.appendChild(el('div',{style:'font-size:2.4rem; text-align:center;'}, '🗺'));
     presetCard.appendChild(el('b',{}, 'Preset Maps'));
-    presetCard.appendChild(el('span',{}, 'Pick from three hand-built, mirrored battlefields — you see exactly what you\'re choosing.'));
+    presetCard.appendChild(el('span',{}, "Pick from three hand-built, mirrored battlefields — you see exactly what you're choosing."));
     presetCard.appendChild(el('button',{onclick:()=>{ G.mapMode='presets'; render(); }}, 'Choose a Map'));
     grid.appendChild(presetCard);
 
@@ -861,10 +1231,12 @@ function renderMapSelect(){
 function renderSetup(){
   const wrap = el('div',{});
   const panel = el('div',{class:'panel'});
-  panel.appendChild(el('h2',{}, `Setup — ${G.map.name}`));
+  const role = G.activeSetupRole;
+  const heading = G.mode==='passPlay' ? `${sideLabel(role)} — Setup — ${G.map.name}` : `Setup — ${G.map.name}`;
+  panel.appendChild(el('h2',{}, heading));
   panel.appendChild(el('div',{class:'budget-line'}, ['Budget: ', el('b',{},String(remainingPoints())), ` / ${totalBudget()} points remaining`]));
   const grid = el('div',{class:'shop-grid'});
-  const hasWater = mapHasLakeForOwner('player');
+  const hasWater = mapHasLakeForOwner(role);
   Object.values(UNIT_TYPES).forEach(def=>{
     if(def.key==='cannonship' && !hasWater) return; // no water on this map to launch it from
     const item = el('div',{class:'shop-item'});
@@ -909,19 +1281,26 @@ function renderBoard(isPlacing){
     viewBox:`${-pad} ${-pad} ${BOARD.w+pad*2} ${BOARD.h+pad*2}`
   });
 
+  const me = viewerRole();
+  const opp = otherRole(me);
+
   drawTerrain(svg, G.map);
 
   const visible = G.phase==='battle' || G.phase==='placing';
   const sel = (!isPlacing && G.selected) ? G.units.find(u=>u.id===G.selected) : null;
 
-  // fog: your own half is always known; the far half is hidden entirely except
-  // inside your units' vision circles. Nothing peeks through — full opacity.
+  // fog: my half is always known; the far half is hidden entirely except inside
+  // my units' vision circles. Nothing peeks through — full opacity.
   if(visible){
     const maskId = 'fogmask';
     const mask = elS('mask',{id:maskId});
     mask.appendChild(elS('rect',{x:-pad,y:-pad,width:BOARD.w+pad*2,height:BOARD.h+pad*2,fill:'white'}));
-    mask.appendChild(elS('rect',{x:0,y:BOARD.h/2,width:BOARD.w,height:BOARD.h/2,fill:'black'}));
-    livingUnits('player').forEach(u=>{
+    if(me==='player'){
+      mask.appendChild(elS('rect',{x:0,y:BOARD.h/2,width:BOARD.w,height:BOARD.h/2,fill:'black'}));
+    } else {
+      mask.appendChild(elS('rect',{x:0,y:0,width:BOARD.w,height:BOARD.h/2,fill:'black'}));
+    }
+    livingUnits(me).forEach(u=>{
       mask.appendChild(elS('circle',{cx:u.x,cy:u.y,r:statsOf(u).vision,fill:'black'}));
     });
     const defs = elS('defs',{}); defs.appendChild(mask);
@@ -930,31 +1309,32 @@ function renderBoard(isPlacing){
   }
 
   // move / attack overlays for the selected unit
-  if(sel && !sel.acted && G.turn==='player'){
+  if(sel && !sel.acted && G.turn===me){
     if(G.uiMode==='move'){
       const poly = reachablePolygon(sel);
-      svg.appendChild(elS('polygon',{points:poly.map(p=>`${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' '), fill:'var(--player)', opacity:'0.18', stroke:'var(--player)', 'stroke-width':0.035}));
+      svg.appendChild(elS('polygon',{points:poly.map(p=>`${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(' '), fill:colorFor(me), opacity:'0.18', stroke:colorFor(me), 'stroke-width':0.035}));
     }
     if(G.uiMode==='attack'){
       const stats = statsOf(sel);
-      svg.appendChild(elS('circle',{cx:sel.x,cy:sel.y,r:stats.range, fill:'var(--enemy)', opacity:'0.10', stroke:'var(--enemy)', 'stroke-width':0.04, 'stroke-dasharray':'0.12,0.09'}));
-      livingUnits('bot').forEach(b=>{
-        if(isUnitVisibleTo('player',b) && dist(sel.x,sel.y,b.x,b.y)<=stats.range){
-          svg.appendChild(elS('circle',{cx:b.x,cy:b.y,r:0.55,fill:'none',stroke:'var(--enemy)','stroke-width':0.06}));
+      svg.appendChild(elS('circle',{cx:sel.x,cy:sel.y,r:stats.range, fill:colorFor(opp), opacity:'0.10', stroke:colorFor(opp), 'stroke-width':0.04, 'stroke-dasharray':'0.12,0.09'}));
+      livingUnits(opp).forEach(b=>{
+        if(isUnitVisibleTo(me,b) && dist(sel.x,sel.y,b.x,b.y)<=stats.range){
+          svg.appendChild(elS('circle',{cx:b.x,cy:b.y,r:0.55,fill:'none',stroke:colorFor(opp),'stroke-width':0.06}));
         }
       });
     }
   }
 
-  // placement zone hint
+  // placement zone hint (highlights whichever half is currently setting up)
   if(isPlacing){
-    svg.appendChild(elS('rect',{x:0.15,y:BOARD.h/2+0.15,width:BOARD.w-0.3,height:BOARD.h/2-0.3, fill:'none', stroke:'var(--gold)', 'stroke-width':0.03, 'stroke-dasharray':'0.15,0.1'}));
+    const hy = me==='player' ? BOARD.h/2+0.15 : 0.15;
+    svg.appendChild(elS('rect',{x:0.15,y:hy,width:BOARD.w-0.3,height:BOARD.h/2-0.3, fill:'none', stroke:'var(--gold)', 'stroke-width':0.03, 'stroke-dasharray':'0.15,0.1'}));
   }
 
   // units
   G.units.forEach(u=>{
     if(u.hp<=0) return;
-    if(visible && u.owner==='bot' && !isUnitVisibleTo('player',u)) return;
+    if(visible && u.owner===opp && !isUnitVisibleTo(me,u)) return;
     const stats = statsOf(u);
     const color = u.owner==='player' ? 'var(--player)' : 'var(--enemy)';
     const dimColor = u.owner==='player' ? 'var(--player-dim)' : 'var(--enemy-dim)';
@@ -978,7 +1358,7 @@ function renderBoard(isPlacing){
   svg.addEventListener('click', (evt)=>{
     const p = svgPointFromEvent(svg, evt);
     const hit = unitAtPoint(p.x, p.y);
-    const validHit = hit && hit.hp>0 && !(visible && hit.owner==='bot' && !isUnitVisibleTo('player',hit)) ? hit : null;
+    const validHit = hit && hit.hp>0 && !(visible && hit.owner===opp && !isUnitVisibleTo(me,hit)) ? hit : null;
     onBoardClick(p.x, p.y, validHit);
   });
 
@@ -999,7 +1379,10 @@ function onBoardClick(x,y,hitUnit){
     if(!hitUnit) placeAt(x,y);
     return;
   }
-  if(G.phase!=='battle' || G.turn!=='player') return;
+  if(G.phase!=='battle') return;
+  const me = viewerRole();
+  if(G.turn !== me) return;
+  const opp = otherRole(me);
 
   if(G.uiMode==='move' && G.selected){
     const u = G.units.find(v=>v.id===G.selected);
@@ -1008,17 +1391,19 @@ function onBoardClick(x,y,hitUnit){
   }
   if(G.uiMode==='attack' && G.selected){
     const u = G.units.find(v=>v.id===G.selected);
-    if(hitUnit && hitUnit.owner==='bot'){
+    if(hitUnit && hitUnit.owner===opp){
       const stats = statsOf(u);
       if(dist(u.x,u.y,hitUnit.x,hitUnit.y) <= stats.range) doAttack(u, hitUnit);
     }
     return;
   }
-  if(hitUnit && hitUnit.owner==='player') selectUnit(hitUnit.id);
+  if(hitUnit && hitUnit.owner===me) selectUnit(hitUnit.id);
 }
 
 function renderSide(isPlacing){
   const side = el('div',{class:'side'});
+  const me = viewerRole();
+
   if(isPlacing){
     const panel = el('div',{class:'panel'});
     panel.appendChild(el('h3',{}, 'Place your units'));
@@ -1032,8 +1417,7 @@ function renderSide(isPlacing){
     return side;
   }
 
-  side.appendChild(el('div',{class:'turn-banner '+(G.turn==='player'?'player':'bot')},
-    G.turn==='player' ? `Your turn — ${G.actionsLeft} action${G.actionsLeft===1?'':'s'} left` : 'Bot is thinking…'));
+  side.appendChild(renderTurnBanner(me));
 
   const infoPanel = el('div',{class:'info-box'});
   const sel = G.selected ? G.units.find(x=>x.id===G.selected) : null;
@@ -1043,7 +1427,7 @@ function renderSide(isPlacing){
     infoPanel.appendChild(el('div',{class:'line'}, `HP ${sel.hp}/${sel.maxHp} · Range ${stats.range} · Dmg ${stats.dmg} · Speed ${stats.speed}`));
     if(sel.acted){
       infoPanel.appendChild(el('div',{class:'line'}, 'Already acted this turn.'));
-    } else if(G.turn==='player'){
+    } else if(G.turn===me){
       const btnRow = el('div',{class:'row', style:'margin-top:8px;'});
       btnRow.appendChild(el('button',{onclick:beginMove, disabled: G.uiMode==='move'}, 'Move'));
       btnRow.appendChild(el('button',{onclick:beginAttack, disabled: G.uiMode==='attack'}, 'Attack'));
@@ -1057,7 +1441,7 @@ function renderSide(isPlacing){
   }
   side.appendChild(infoPanel);
 
-  if(G.turn==='player') side.appendChild(el('button',{class:'danger', onclick:endPlayerTurn}, 'End Turn'));
+  if(G.turn===me) side.appendChild(el('button',{class:'danger', onclick:endPlayerTurn}, 'End Turn'));
 
   const logBox = el('div',{class:'log'});
   [...G.log].reverse().forEach(line => logBox.appendChild(el('div',{},line)));
@@ -1065,22 +1449,57 @@ function renderSide(isPlacing){
   return side;
 }
 
+function renderTurnBanner(me){
+  const bannerClass = G.turn==='player' ? 'player' : 'bot';
+  let text;
+  if(G.mode === 'passPlay'){
+    text = `${sideLabel(G.turn)}'s turn — ${G.actionsLeft} action${G.actionsLeft===1?'':'s'} left`;
+  } else if(G.turn === me){
+    text = `Your turn — ${G.actionsLeft} action${G.actionsLeft===1?'':'s'} left`;
+  } else {
+    text = G.mode==='vsBot' ? 'Bot is thinking…' : "Opponent's turn…";
+  }
+  return el('div',{class:'turn-banner '+bannerClass}, text);
+}
+
+function roundHeadline(winnerRole){
+  const label = sideLabel(winnerRole);
+  const verb = (label === 'You') ? 'win' : 'wins';
+  return `${label} ${verb} round ${G.round}!`;
+}
+
 function renderRoundOver(){
   const p = el('div',{class:'panel center-msg'});
-  const won = G.roundWinner==='player';
-  p.appendChild(el('div',{style:'font-size:2.4rem; margin-bottom:6px;'}, won?'🏆':'💥'));
-  p.appendChild(el('h2',{style: won?'color:var(--player)':'color:var(--enemy)'}, won?`You won round ${G.round}!`:`The bot won round ${G.round}.`));
-  p.appendChild(el('p',{}, `Score: You ${G.wins.player} – ${G.wins.bot} Bot`));
-  p.appendChild(el('button',{onclick:nextRound}, `Continue to Round ${G.round+1}`));
+  const iAmWinner = G.mode!=='passPlay' && G.roundWinner===viewerRole();
+  const icon = G.mode==='passPlay' ? '🏁' : (iAmWinner ? '🏆' : '💥');
+  p.appendChild(el('div',{style:'font-size:2.4rem; margin-bottom:6px;'}, icon));
+  p.appendChild(el('h2',{style:'color:'+colorFor(G.roundWinner)}, roundHeadline(G.roundWinner)));
+  p.appendChild(el('p',{}, `${sideLabel('player')} ${G.wins.player} – ${G.wins.bot} ${sideLabel('bot')}`));
+  if(G.mode!=='online' || G.myRole==='player'){
+    p.appendChild(el('button',{onclick:nextRound}, `Continue to Round ${G.round+1}`));
+  } else {
+    p.appendChild(el('p',{class:'hint'}, 'Waiting for the host to continue…'));
+  }
   return p;
 }
 function renderMatchOver(){
   const p = el('div',{class:'panel center-msg'});
-  const won = G.wins.player > G.wins.bot;
-  p.appendChild(el('div',{style:'font-size:2.4rem; margin-bottom:6px;'}, won?'👑':'☠'));
-  p.appendChild(el('h2',{style: won?'color:var(--player)':'color:var(--enemy)'}, won?'Victory! You win the match.':'Defeat. The bot wins the match.'));
-  p.appendChild(el('p',{}, `Final score: You ${G.wins.player} – ${G.wins.bot} Bot · ${DIFFICULTIES[G.difficulty].label} difficulty`));
-  p.appendChild(el('button',{onclick:newMatch}, 'Play Again'));
+  const winnerRole = G.wins.player > G.wins.bot ? 'player' : 'bot';
+  const iAmWinner = G.mode!=='passPlay' && winnerRole===viewerRole();
+  const icon = G.mode==='passPlay' ? '🏁' : (iAmWinner ? '👑' : '☠');
+  p.appendChild(el('div',{style:'font-size:2.4rem; margin-bottom:6px;'}, icon));
+  const label = sideLabel(winnerRole);
+  const verb = (label==='You') ? 'win' : 'wins';
+  p.appendChild(el('h2',{style:'color:'+colorFor(winnerRole)}, `${label} ${verb} the match!`));
+  let footer = `Final score: ${sideLabel('player')} ${G.wins.player} – ${G.wins.bot} ${sideLabel('bot')}`;
+  if(G.mode==='vsBot') footer += ` · ${DIFFICULTIES[G.difficulty].label} difficulty`;
+  p.appendChild(el('p',{}, footer));
+  if(G.mode==='online'){
+    if(G.myRole==='player') p.appendChild(el('button',{onclick:onlineRematch}, 'Rematch'));
+    else p.appendChild(el('p',{class:'hint'}, 'Waiting for the host to start a rematch…'));
+  } else {
+    p.appendChild(el('button',{onclick:newMatch}, 'Play Again'));
+  }
   return p;
 }
 
